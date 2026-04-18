@@ -1,0 +1,111 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# pentagent .gitignore
+# This repo contains an authorized-use-only pentesting agent. NEVER commit:
+#   - scope files pointing at real targets
+#   - API keys, tokens, or local LLM endpoints with credentials
+#   - session output directories (findings, evidence, audit logs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+.installed.cfg
+MANIFEST
+
+# --- Virtual environments ---------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Env & secrets ----------------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+.secrets/
+secrets.yaml
+secrets.yml
+
+# --- Testing / coverage -----------------------------------------------------
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# --- IDEs / editors ---------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Jupyter ----------------------------------------------------------------
+.ipynb_checkpoints/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# pentagent-specific — session outputs and engagement-scoped configs
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Session outputs: contain findings, evidence, raw tool output, audit chain,
+# and the knowledge graph SQLite DB. NEVER push these.
+runs/
+*.sqlite
+*.sqlite3
+*.db
+audit.jsonl
+report.md
+report.json
+knowledge.db
+
+# Engagement-specific scope and config files. Only the *.example.yaml
+# templates are committed; real scope files pointing at live targets
+# (Bugcrowd programs, lab URLs, client environments) stay local.
+config/scope.underarmour.yaml
+config/scope.juiceshop.yaml
+config/config.ollama.yaml
+config/scope.*.yaml
+config/config.*.yaml
+!config/scope.example.yaml
+!config/config.example.yaml
+
+# Temporary / scratch files
+tmp/
+.tmp/
+*.tmp
+*.log

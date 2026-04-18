@@ -1,0 +1,36 @@
+# SCOPE DEFINITION — this file represents your written authorization.
+# You MUST fill in program_name, authorized_by, and authorized_on with real
+# values, and you MUST keep a copy of the actual written authorization
+# (bug bounty program page, engagement letter, CTF rules, etc.) alongside this
+# file. Running against targets not listed here is blocked at the executor.
+
+program_name: "example-bounty-program"
+authorized_by: "program owner / engagement contact"
+authorized_on: "2026-01-01"
+authorization_source: "https://example-program.com/scope"   # URL or filename
+operator: "tristanvaquero@gmail.com"
+
+# Allowlist. Only hosts/URLs whose apex is listed here can be scanned.
+# Supported forms: domain, wildcard domain, IP, CIDR.
+include:
+  - "*.example.com"
+  - "example.com"
+  - "api.example.com"
+  # - "10.10.10.0/24"      # CIDR (lab only)
+
+# Hard exclusions override include matches.
+exclude:
+  - "admin.example.com"
+  - "status.example.com"
+  - "*.staff.example.com"
+
+# Per-target opt-ins for destructive / active checks.
+# Must be explicit even in aggressive mode.
+aggressive_opt_in:
+  - "api.example.com"        # sqlmap, nuclei fuzz, etc. allowed here
+
+# Rules of engagement / notes for the LLM reporter.
+notes: |
+  No DoS. No social engineering. No physical attacks. Stop on first auth
+  bypass and report. Respect bounty program's in-scope vs out-of-scope list
+  in all edge cases.

@@ -1,0 +1,79 @@
+# pentagent configuration — copy to ./config/config.yaml and edit.
+
+session:
+  # Hard stops for the run; the orchestrator will exit before exceeding any.
+  max_iterations: 50
+  wallclock_minutes: 60
+  max_cost_usd: 5.00
+  mode: safe          # "safe" or "aggressive" — aggressive requires per-target opt-in
+
+llm:
+  default: anthropic
+  providers:
+    anthropic:
+      model: claude-opus-4-6
+      api_key_env: ANTHROPIC_API_KEY
+      max_tokens: 4096
+    openai:
+      model: gpt-4.1
+      api_key_env: OPENAI_API_KEY
+      max_tokens: 4096
+    local:
+      # Any OpenAI-compatible endpoint (Ollama, vLLM, LM Studio, llama.cpp).
+      base_url: http://127.0.0.1:11434/v1
+      model: llama3.1:70b
+      api_key_env: LOCAL_LLM_API_KEY   # usually unused, set to any value
+      max_tokens: 4096
+  routing:
+    planner: anthropic
+    analyzer: anthropic
+    hypothesizer: anthropic
+    reporter: anthropic
+
+tools:
+  # Each tool may be disabled or have defaults overridden here.
+  nmap:
+    enabled: true
+    default_flags: ["-sV", "-Pn", "--top-ports", "1000"]
+    timeout_seconds: 300
+  httpx:
+    enabled: true
+    default_flags: ["-silent", "-sc", "-title", "-tech-detect", "-json"]
+    timeout_seconds: 120
+  subfinder:
+    enabled: true
+    timeout_seconds: 120
+  amass:
+    enabled: false              # heavy by default
+  ffuf:
+    enabled: true
+    wordlist: /usr/share/seclists/Discovery/Web-Content/common.txt
+    timeout_seconds: 300
+    requests_per_second: 20
+  gobuster:
+    enabled: true
+    wordlist: /usr/share/seclists/Discovery/Web-Content/common.txt
+  nuclei:
+    enabled: true
+    severity: "low,medium,high,critical"
+    rate_limit: 50
+    timeout_seconds: 600
+  sqlmap:
+    enabled: false              # only in aggressive + per-target opt-in
+    risk: 1
+    level: 1
+  nikto:
+    enabled: true
+    timeout_seconds: 300
+  katana:
+    enabled: true
+
+safety:
+  per_host_rate_limit_rps: 20
+  global_rate_limit_rps: 100
+  deny_private_ranges_unless_explicit: true
+  require_authorization_flag: true
+
+output:
+  dir: ./runs
+  report_format: ["markdown", "json"]
