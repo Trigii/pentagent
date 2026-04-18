@@ -50,20 +50,40 @@ def _apply_profile(settings: Settings, name: str) -> str:
         return tools[tool_name]
 
     if name == "fast":
-        # 15-min triage: only the fastest recon. No content discovery, no
-        # crawling, minimal nuclei, top-100 port scan. Good for a smoke test.
-        settings.session.wallclock_minutes = min(settings.session.wallclock_minutes, 15)
-        settings.session.max_iterations = min(settings.session.max_iterations, 15)
+        # 20-min triage designed to actually *find things*: shallow but
+        # productive. Earlier iterations of this profile disabled every
+        # content-discovery tool, which left the agent looping on nuclei
+        # variants with nothing new to do. We now keep ffuf + a one-deep
+        # katana crawl so the graph grows past httpx's initial tech-detect.
+        settings.session.wallclock_minutes = min(settings.session.wallclock_minutes, 20)
+        settings.session.max_iterations = min(settings.session.max_iterations, 25)
+        settings.session.parallel_actions = max(settings.session.parallel_actions, 4)
+        # nmap: top-100 TCP only, aggressive timing — finishes in ~30s per host
         t("nmap").default_flags = ["-sV", "-Pn", "--top-ports", "100", "-T4"]
+        # ffuf: small wordlist, one pass, moderate RPS
+        ffuf = t("ffuf")
+        ffuf.enabled = True
+        ffuf.extras.setdefault(
+            "wordlist", "/usr/share/seclists/Discovery/Web-Content/common.txt"
+        )
+        ffuf.extras["requests_per_second"] = max(int(ffuf.extras.get("requests_per_second", 30)), 30)
+        # katana: minimal crawl — just the landing page + inline JS
+        katana = t("katana")
+        katana.enabled = True
+        katana.extras["depth"] = 1
+        # gobuster/nikto: skip (redundant in a triage budget)
+        t("gobuster").enabled = False
+        t("nikto").enabled = False
+        # nuclei: info through medium (dos/intrusive/fuzz excluded always)
         nuclei = t("nuclei")
         nuclei.enabled = True
-        nuclei.extras["severity"] = "info,low"
-        nuclei.extras["rate_limit"] = 40
-        t("ffuf").enabled = False
-        t("gobuster").enabled = False
-        t("katana").enabled = False
-        t("nikto").enabled = False
-        return "fast: httpx + subfinder + nmap top-100 + nuclei info/low (15m/15 iter)"
+        nuclei.extras["severity"] = "info,low,medium"
+        nuclei.extras["rate_limit"] = max(int(nuclei.extras.get("rate_limit", 50)), 50)
+        nuclei.extras.setdefault("exclude_tags", ["dos", "intrusive", "fuzz"])
+        return (
+            "fast: httpx + subfinder + nmap top-100 + ffuf common + katana d=1 "
+            "+ nuclei info/low/medium (20m/25 iter, parallel=4)"
+        )
 
     if name == "standard":
         # Leave the user's YAML as-is — it's the reference profile.
@@ -104,6 +124,56 @@ def _apply_profile(settings: Settings, name: str) -> str:
     raise typer.BadParameter(f"unknown profile {name!r}; expected fast|standard|deep")
 
 
+# ---------------------------------------------------------------------------
+# CTF / lab posture — unlocks aggressive-class tools without per-target opt-in,
+# relaxes RFC1918 scope guard (HTB/THM live in 10.10.x.x), bumps rate limits,
+# and tells httpx to probe common non-default web ports. This is deliberately
+# a separate gear above --profile; it applies on top of any profile.
+# ---------------------------------------------------------------------------
+def _apply_ctf_posture(settings: Settings) -> str:
+    tools = settings.tools
+    def t(tool_name):
+        if tool_name not in tools:
+            from .config import ToolConfig
+            tools[tool_name] = ToolConfig()
+        return tools[tool_name]
+
+    settings.session.mode = "ctf"
+    # Rate limits loosened — lab boxes aren't production
+    settings.safety.per_host_rate_limit_rps = max(settings.safety.per_host_rate_limit_rps, 100)
+    settings.safety.global_rate_limit_rps = max(settings.safety.global_rate_limit_rps, 500)
+    # HTB/THM live in private ranges
+    settings.safety.deny_private_ranges_unless_explicit = False
+    # Wider nuclei sweep; drop the safe-mode exclusions except the truly
+    # destructive ones (dos could brick a shared lab)
+    nuclei = t("nuclei")
+    nuclei.enabled = True
+    nuclei.extras["severity"] = "info,low,medium,high,critical"
+    nuclei.extras["exclude_tags"] = ["dos"]
+    nuclei.extras["rate_limit"] = max(int(nuclei.extras.get("rate_limit", 50)), 150)
+    # httpx: probe common non-default ports — lab webapps are often on 8080/8443
+    t("httpx").extras["include_common_ports"] = True
+    # sqlmap: on. Heuristic bypasses per-target opt-in in ctf mode (see heuristics.py)
+    t("sqlmap").enabled = True
+    # ffuf: bigger wordlist, more rps
+    ffuf = t("ffuf")
+    ffuf.enabled = True
+    ffuf.extras.setdefault(
+        "wordlist", "/usr/share/seclists/Discovery/Web-Content/raft-small-directories.txt"
+    )
+    ffuf.extras["requests_per_second"] = max(int(ffuf.extras.get("requests_per_second", 50)), 50)
+    # gobuster fallback still on
+    t("gobuster").enabled = True
+    # katana: depth 2, happy to parse JS
+    katana = t("katana")
+    katana.enabled = True
+    katana.extras["depth"] = max(int(katana.extras.get("depth", 2)), 2)
+    return (
+        "ctf: mode=ctf, private ranges allowed, aggressive tools unlocked, "
+        "httpx probes common ports, sqlmap auto-opt-in"
+    )
+
+
 app = typer.Typer(no_args_is_help=True, help="Authorized pentesting agent.")
 console = Console()
 logger = get_logger(__name__)
@@ -137,11 +207,23 @@ def run(
         "--i-have-authorization",
         help="You attest you have written authorization for all targets in scope.",
     ),
-    mode: str = typer.Option(None, "--mode", help="Override session.mode from config (safe|aggressive)"),
+    mode: str = typer.Option(None, "--mode", help="Override session.mode from config (safe|aggressive|ctf)"),
     profile: str = typer.Option(
         "standard",
         "--profile",
-        help="Scan depth profile: fast (15m triage) | standard (as configured) | deep (multi-hour).",
+        help="Scan depth profile: fast (20m triage) | standard (as configured) | deep (multi-hour).",
+    ),
+    ctf: bool = typer.Option(
+        False,
+        "--ctf",
+        help="CTF/lab posture: unlocks aggressive tools without per-target opt-in, "
+             "allows RFC1918 targets, loosens rate limits. Use only on boxes you own "
+             "or a platform you are actively playing (HTB, THM, labs).",
+    ),
+    parallel: int = typer.Option(
+        None,
+        "--parallel",
+        help="Actions to run concurrently per iteration (default from config, usually 4).",
     ),
     log_level: str = typer.Option("INFO", "--log-level"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Build orchestrator but do not iterate."),
@@ -163,6 +245,11 @@ def run(
         settings.session.mode = mode
     profile_desc = _apply_profile(settings, profile)
     console.print(f"[cyan]profile[/cyan] {profile_desc}")
+    if ctf:
+        ctf_desc = _apply_ctf_posture(settings)
+        console.print(f"[cyan]posture[/cyan] {ctf_desc}")
+    if parallel is not None:
+        settings.session.parallel_actions = max(1, int(parallel))
 
     # Pre-flight: each seed target must pass scope
     from .safety import ScopeGuard, ScopeViolation
@@ -193,6 +280,7 @@ def run(
         planner_llm=planner_llm,
         session_dir=session_dir,
         seed_targets=target,
+        parallel_actions=settings.session.parallel_actions,
     )
 
     if dry_run:

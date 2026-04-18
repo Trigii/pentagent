@@ -423,9 +423,11 @@ class HeuristicPlanner:
                 )
 
         # -----------------------------------------------------------------
-        # 10. Endpoints with query strings + aggressive opt-in → sqlmap.
+        # 10. Endpoints with query strings → sqlmap. Gated by session.mode:
+        #   - aggressive: requires per-target `aggressive_opt_in` in scope
+        #   - ctf:        auto-opt-in (owned lab machines, HTB, THM, etc.)
         # -----------------------------------------------------------------
-        if cfg.session.mode == "aggressive" and cfg.tool("sqlmap").enabled:
+        if cfg.session.mode in ("aggressive", "ctf") and cfg.tool("sqlmap").enabled:
             for e in endpoints:
                 if e.id in done.sqlmap_done:
                     continue
@@ -435,7 +437,8 @@ class HeuristicPlanner:
                 if not webapp:
                     continue
                 full = f"{webapp.base_url}{e.path}"
-                if not self._aggressive_opt_in(full):
+                # CTF mode bypasses per-target opt-in; aggressive still honors it.
+                if cfg.session.mode == "aggressive" and not self._aggressive_opt_in(full):
                     continue
                 out.append(
                     Action(

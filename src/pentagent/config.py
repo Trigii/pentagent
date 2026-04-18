@@ -49,7 +49,12 @@ class SessionConfig(BaseModel):
     max_iterations: int = 50
     wallclock_minutes: int = 60
     max_cost_usd: float = 5.0
-    mode: Literal["safe", "aggressive"] = "safe"
+    mode: Literal["safe", "aggressive", "ctf"] = "safe"
+    # How many signature-distinct actions to run in parallel per iteration.
+    # 1 restores the previous serial behavior. 4 is a good default on
+    # modern laptops where subprocess I/O dominates. Higher values help
+    # only if the target and network can sustain them.
+    parallel_actions: int = 4
 
 
 class SafetyConfig(BaseModel):

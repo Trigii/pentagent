@@ -3,10 +3,27 @@
 Keeps no state of its own — everything observable is in the KnowledgeStore
 and everything recorded is in the AuditLog. That makes a session
 resumable and fully reproducible from disk.
+
+**Concurrency model.** Each iteration picks up to `parallel_actions`
+signature-distinct candidates and dispatches them through a thread pool.
+Subprocess tool runs are overwhelmingly I/O-bound (waiting on nmap/nuclei
+to finish their own work), so threads give near-linear speedup without
+touching the GIL. Safety layers are inside `Executor.run()` and are
+thread-safe (AuditLog and RateLimiter both hold their own locks).
+
+**Stall detection.** If `stall_patience` consecutive iterations commit
+zero new entities AND produce no new candidates, the session ends with
+`stop_reason='no_progress'` rather than burning wallclock on identical
+nuclei sweeps.
+
+**Cache handling.** Cache hits return a ToolResult with `argv=[]`; we
+skip parse+commit for those so an empty stdout doesn't churn the DB or
+drown the logs in `committed 0` lines.
 """
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,8 +51,8 @@ class SessionBudget:
     iterations: int = 0
     spent_usd: float = 0.0
 
-    def tick(self) -> None:
-        self.iterations += 1
+    def tick(self, n: int = 1) -> None:
+        self.iterations += n
 
     def wall_remaining(self) -> float:
         return self.wallclock_seconds - (time.time() - self.started_at)
@@ -68,11 +85,18 @@ class Orchestrator:
         planner_llm: LLMClient | None,
         session_dir: Path,
         seed_targets: list[str],
+        parallel_actions: int | None = None,
+        stall_patience: int = 3,
     ) -> None:
         self.settings = settings
         self.scope = scope
         self.session_dir = session_dir
         self.seed_targets = seed_targets
+        self.parallel_actions = int(
+            parallel_actions if parallel_actions is not None
+            else getattr(settings.session, "parallel_actions", 4) or 4
+        )
+        self.stall_patience = int(stall_patience)
 
         session_dir.mkdir(parents=True, exist_ok=True)
         self.store = KnowledgeStore(session_dir / "knowledge.db")
@@ -115,6 +139,7 @@ class Orchestrator:
                 "seed_targets": seed_targets,
                 "mode": settings.session.mode,
                 "session_dir": str(session_dir),
+                "parallel_actions": self.parallel_actions,
             },
         )
 
@@ -168,20 +193,17 @@ class Orchestrator:
                 obs.hosts.append(Host(hostname=hostname))
                 host_ph = -(len(obs.hosts))
             else:
-                # find existing placeholder
                 host_ph = -(list(seen_host_keys).index(key) + 1)
 
-            # WebApp only if the seed looks web-oriented
             obs.webapps.append(
                 WebApp(host_id=host_ph, scheme=scheme, base_url=base_url)
             )
 
-            # DNS resolve — best-effort, 2s timeout via socket default
+            # DNS resolve — best-effort
             resolved: set[str] = set()
             try:
                 for info in socket.getaddrinfo(hostname, None):
                     ip = info[4][0]
-                    # strip zone id on link-local
                     resolved.add(ip.split("%", 1)[0])
             except (socket.gaierror, UnicodeError, OSError) as e:
                 logger.debug(f"DNS resolve failed for {hostname}: {e}")
@@ -193,11 +215,8 @@ class Orchestrator:
                 seen_host_keys.add(k)
                 try:
                     self.scope_guard.check(ip)
-                    # In scope → will be probe-eligible
                     obs.hosts.append(Host(ip=ip, hostname=hostname))
                 except ScopeViolation:
-                    # Record it for the report, but mark os_guess so the
-                    # planner's _in_scope check is the one that filters it
                     obs.hosts.append(
                         Host(ip=ip, hostname=hostname, os_guess="OOS (resolved only)")
                     )
@@ -217,10 +236,12 @@ class Orchestrator:
         logger.info(f"[bold green]pentagent[/bold green] starting session {self.session_dir.name}")
         logger.info(
             f"[bold]program[/bold]={self.scope.program_name} "
-            f"[bold]mode[/bold]={self.settings.session.mode}"
+            f"[bold]mode[/bold]={self.settings.session.mode} "
+            f"[bold]parallel[/bold]={self.parallel_actions}"
         )
         self._bootstrap_seeds()
         stop_reason = "unknown"
+        stall_counter = 0
         try:
             while True:
                 exhausted, why = self.budget.exhausted()
@@ -235,19 +256,40 @@ class Orchestrator:
                     stop_reason = "no_more_actions"
                     break
 
-                action = candidates[0]
-                logger.info(
-                    f"[bold]iter {self.budget.iterations + 1}[/bold]: {action.tool} "
-                    f"priority={action.priority} reason={action.reason!r}"
-                )
-                try:
-                    self._execute(action)
-                except ExecutionError as e:
-                    logger.warning(f"execution failed: {e}")
-                    self.audit.log(
-                        "iter_error", {"action": action.__dict__, "error": str(e)}
-                    )
-                self.budget.tick()
+                # Pick a batch of signature-distinct candidates to run in
+                # parallel. Planner already dedupes against the action_log;
+                # this extra pass keeps sibling duplicates from sneaking in.
+                batch: list[Action] = []
+                sigs: set[str] = set()
+                for a in candidates:
+                    if len(batch) >= self.parallel_actions:
+                        break
+                    s = a.signature()
+                    if s in sigs:
+                        continue
+                    sigs.add(s)
+                    batch.append(a)
+
+                iter_start_total = len(self.store.hosts()) + len(self.store.webapps()) + \
+                                   len(self.store.endpoints()) + len(self.store.findings()) + \
+                                   len(self.store.services())
+
+                counts_total = self._execute_batch(batch)
+                self.budget.tick(len(batch))
+
+                # Stall detection: compare graph totals before/after.
+                iter_end_total = len(self.store.hosts()) + len(self.store.webapps()) + \
+                                 len(self.store.endpoints()) + len(self.store.findings()) + \
+                                 len(self.store.services())
+                if iter_end_total == iter_start_total:
+                    stall_counter += 1
+                    logger.info(f"[dim]no new entities this iteration ({stall_counter}/{self.stall_patience})[/dim]")
+                    if stall_counter >= self.stall_patience:
+                        stop_reason = "no_progress"
+                        break
+                else:
+                    stall_counter = 0
+
         except KeyboardInterrupt:
             stop_reason = "user_interrupt"
             logger.warning("[bold red]interrupted — shutting down cleanly[/bold red]")
@@ -264,9 +306,44 @@ class Orchestrator:
             "hosts": len(self.store.hosts()),
         }
 
-    # ---------------------------------------------------------------- step
-    def _execute(self, action: Action) -> None:
-        timeout = int(self.settings.tool(action.tool).timeout_seconds)
+    # ---------------------------------------------------------------- batch
+    def _execute_batch(self, batch: list[Action]) -> dict[str, int]:
+        """Run a set of independent actions concurrently. Each is:
+           execute → parse → commit (under lock, inside KnowledgeStore)."""
+        if not batch:
+            return {}
+
+        # Announce the whole batch up-front so the log reads naturally.
+        for a in batch:
+            logger.info(
+                f"[bold]iter {self.budget.iterations + 1}+[/bold] → "
+                f"{a.tool} priority={a.priority} reason={a.reason!r}"
+            )
+
+        totals: dict[str, int] = {}
+        with ThreadPoolExecutor(max_workers=max(1, len(batch))) as pool:
+            futures: list[tuple[Action, Future]] = []
+            for a in batch:
+                timeout = int(self.settings.tool(a.tool).timeout_seconds)
+                futures.append((a, pool.submit(self._run_one, a, timeout)))
+
+            for a, fut in futures:
+                try:
+                    counts = fut.result()
+                except Exception as e:
+                    logger.warning(f"[yellow]{a.tool} failed:[/yellow] {e}")
+                    self.audit.log(
+                        "iter_error", {"action": {"tool": a.tool, "params": a.params}, "error": str(e)}
+                    )
+                    continue
+                for k, v in counts.items():
+                    totals[k] = totals.get(k, 0) + v
+        return totals
+
+    def _run_one(self, action: Action, timeout: int) -> dict[str, int]:
+        """Execute a single action: exec → parse → commit → return counts.
+        Runs inside the thread pool; must not touch orchestrator mutable
+        state directly — only the KnowledgeStore (which locks internally)."""
         result = self.executor.run(action.tool, action.params, timeout=timeout)
         self.audit.log(
             "iter_summary",
@@ -276,7 +353,21 @@ class Orchestrator:
             },
         )
 
-        # Parse -> Observation -> commit
+        # Cache hit: executor returns argv=[] as the marker. No parsing.
+        if not result.argv:
+            logger.info(f"[dim]  {action.tool} cache hit — skipping parse[/dim]")
+            return {}
+
+        # Empty stdout from a successful exec is usually a signal: wrong
+        # scheme, unreachable host, misconfigured VPN. Surface it.
+        if result.exit_code == 0 and not result.stdout.strip():
+            stderr_tail = (result.stderr or "").strip().splitlines()[-3:]
+            logger.warning(
+                f"[yellow]{action.tool} produced no stdout[/yellow] "
+                f"(exit=0, duration={result.duration_s:.1f}s). "
+                f"stderr tail: {stderr_tail!r}"
+            )
+
         try:
             obs = parse_for(action.tool, result, action.parser_context)
         except Exception as e:
@@ -285,5 +376,7 @@ class Orchestrator:
 
         counts = self.store.commit(obs)
         logger.info(
-            f"[green]  committed[/green] {counts}  (excerpt_len={len(obs.raw_excerpt or '')})"
+            f"[green]  {action.tool} committed[/green] {counts}  "
+            f"(excerpt_len={len(obs.raw_excerpt or '')})"
         )
+        return counts

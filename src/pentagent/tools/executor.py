@@ -74,8 +74,11 @@ class Executor:
         aggressive = required_mode == "aggressive"
         self._scope_check(tool, params, aggressive=aggressive)
 
-        # 2. Mode gate
-        if aggressive and self.session_mode != "aggressive" and not tool.spec.bypasses_mode_gate:
+        # 2. Mode gate. "ctf" mode is a superset of "aggressive" for gating
+        # purposes — labs/CTF targets are owned by the operator and
+        # destructive tools are acceptable without per-target opt-in.
+        elevated_session = self.session_mode in ("aggressive", "ctf")
+        if aggressive and not elevated_session and not tool.spec.bypasses_mode_gate:
             self._audit_reject(tool, params, reason="mode_gate_denied")
             raise ExecutionError(
                 f"tool {tool.name} requires aggressive mode but session is {self.session_mode!r}"
