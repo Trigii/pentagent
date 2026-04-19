@@ -87,3 +87,16 @@ class Action:
         avoid proposing the same tool-against-target twice, regardless of
         severity/wordlist/rate variations."""
         return f"{self.tool}::{_canonical_target(self.params)}"
+
+    def phase(self):
+        """Attack-lifecycle phase (recon/enum/vuln/exploit/report). Derived
+        from the tool — late-import to avoid a circular dependency with
+        strategy.phases which otherwise imports Action for typing."""
+        from .phases import phase_of
+        return phase_of(self.tool)
+
+    def sort_key(self) -> tuple[int, int]:
+        """Tuple used by planners to order candidates.
+        Earlier phase first (lower number), then higher priority first.
+        Bundle this in one place so LLM rerank + heuristic sort agree."""
+        return (int(self.phase()), -int(self.priority))

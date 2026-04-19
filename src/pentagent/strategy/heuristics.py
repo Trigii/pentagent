@@ -456,7 +456,8 @@ class HeuristicPlanner:
                     )
                 )
 
-        out.sort(key=lambda a: -a.priority)
+        # Phase-aware ordering: earlier phase wins, ties broken by priority.
+        out.sort(key=lambda a: a.sort_key())
         return out
 
     # ------------------------------------------------------------------

@@ -148,7 +148,8 @@ class LLMPlanner:
         # brought an already-executed action to the top.
         ranked = [a for a in ranked if a.signature() not in executed]
 
-        ranked.sort(key=lambda a: -a.priority)
+        # Phase-aware ordering: earlier phase wins, ties by priority.
+        ranked.sort(key=lambda a: a.sort_key())
         return ranked
 
     def is_done(self, store: KnowledgeStore) -> tuple[bool, str]:

@@ -69,12 +69,32 @@ class OutputConfig(BaseModel):
     report_format: list[str] = Field(default_factory=lambda: ["markdown", "json"])
 
 
+class CVEEnrichmentConfig(BaseModel):
+    """Post-commit CVE correlation via NVD. Optional and offline-safe —
+    a run with no internet simply produces no CVE findings.
+
+    Defaults are conservative: enabled by default so users get obvious
+    wins (detected Apache/Nginx versions → matching CVEs), but with a
+    short 6-second HTTP timeout and a min CVSS filter so low-severity
+    advisories don't drown the report.
+    """
+    enabled: bool = True
+    timeout_s: float = 6.0
+    min_cvss: float = 4.0
+    api_key_env: str | None = None     # "NVD_API_KEY" if you have one
+
+
+class EnrichmentConfig(BaseModel):
+    cve: CVEEnrichmentConfig = CVEEnrichmentConfig()
+
+
 class Settings(BaseModel):
     session: SessionConfig = SessionConfig()
     llm: LLMConfig
     tools: dict[str, ToolConfig] = Field(default_factory=dict)
     safety: SafetyConfig = SafetyConfig()
     output: OutputConfig = OutputConfig()
+    enrichment: EnrichmentConfig = EnrichmentConfig()
 
     @field_validator("tools", mode="before")
     @classmethod

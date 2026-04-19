@@ -36,6 +36,9 @@ from ..parsers import parse_for
 from ..safety import AuditLog, RateLimiter, Scope, ScopeGuard
 from ..safety.scope import ScopeViolation
 from ..strategy import Action, HeuristicPlanner, HybridPlanner, LLMPlanner
+from ..strategy.phases import Phase, dominant_phase, phase_of
+from ..knowledge import map_tool
+from ..enrichment import CVEEnricher, enrich_webapps_and_services
 from ..tools import Executor, ExecutionError, default_registry
 
 
@@ -126,6 +129,21 @@ class Orchestrator:
             wallclock_seconds=settings.session.wallclock_minutes * 60,
             max_cost_usd=settings.session.max_cost_usd,
         )
+
+        # CVE enrichment — one instance per session, cached on disk so
+        # repeated iterations against the same tech don't burn NVD quota.
+        import os
+        api_key_env = settings.enrichment.cve.api_key_env
+        api_key = os.environ.get(api_key_env) if api_key_env else None
+        self.cve_enricher = CVEEnricher(
+            cache_path=session_dir / "cve_cache.json",
+            enabled=settings.enrichment.cve.enabled,
+            timeout_s=settings.enrichment.cve.timeout_s,
+            min_cvss=settings.enrichment.cve.min_cvss,
+            api_key=api_key,
+        )
+        # Per-session dedup so we don't re-file the same CVE finding each iter
+        self._cve_seen: set[str] = set()
 
         # Authorization banner — burned into the audit log
         self.audit.log(
@@ -242,6 +260,9 @@ class Orchestrator:
         self._bootstrap_seeds()
         stop_reason = "unknown"
         stall_counter = 0
+        current_phase: Phase = Phase.recon
+        phase_entity_counts: dict[str, dict[str, int]] = {}
+        report_artifacts: dict = {}
         try:
             while True:
                 exhausted, why = self.budget.exhausted()
@@ -255,6 +276,22 @@ class Orchestrator:
                 if not candidates:
                     stop_reason = "no_more_actions"
                     break
+
+                # Emit a phase-transition audit record if the dominant phase
+                # in the candidate pool has advanced since last iteration.
+                # This is observability — it does not gate execution.
+                dom = dominant_phase(candidates)
+                if dom > current_phase:
+                    self.audit.log(
+                        "phase_transition",
+                        {"from": current_phase.label, "to": dom.label,
+                         "candidates": len(candidates)},
+                    )
+                    logger.info(
+                        f"[bold cyan]phase →[/bold cyan] "
+                        f"{current_phase.label} → {dom.label}"
+                    )
+                    current_phase = dom
 
                 # Pick a batch of signature-distinct candidates to run in
                 # parallel. Planner already dedupes against the action_log;
@@ -277,6 +314,12 @@ class Orchestrator:
                 counts_total = self._execute_batch(batch)
                 self.budget.tick(len(batch))
 
+                # Post-batch enrichment: match new tech fingerprints against
+                # NVD. Runs once per iteration, not per tool, so one NVD
+                # round-trip covers any webapp/service discoveries made in
+                # this batch. Network failures are absorbed silently.
+                self._run_cve_enrichment()
+
                 # Stall detection: compare graph totals before/after.
                 iter_end_total = len(self.store.hosts()) + len(self.store.webapps()) + \
                                  len(self.store.endpoints()) + len(self.store.findings()) + \
@@ -296,15 +339,85 @@ class Orchestrator:
         finally:
             self.audit.log(
                 "session_end",
-                {"reason": stop_reason, "budget": self.budget.snapshot()},
+                {
+                    "reason": stop_reason,
+                    "budget": self.budget.snapshot(),
+                    "last_phase": current_phase.label,
+                },
             )
-        return {
+            # Final phase: report. Runs even on interrupt so partial work
+            # is captured as a deliverable rather than lost. Failures are
+            # logged but never abort shutdown — the knowledge DB is always
+            # the source of truth and a later `pentagent report` can retry.
+            report_artifacts = self._auto_report()
+
+        summary = {
             "reason": stop_reason,
             "budget": self.budget.snapshot(),
             "findings": len(self.store.findings()),
             "endpoints": len(self.store.endpoints()),
             "hosts": len(self.store.hosts()),
+            "last_phase": current_phase.label,
+            "report_artifacts": {k: str(v) for k, v in (report_artifacts or {}).items()},
         }
+        # Headline summary — by severity breakdown + risk
+        breakdown = self._severity_breakdown()
+        summary["severity_breakdown"] = breakdown
+        summary["overall_risk"] = self._overall_risk_label()
+        return summary
+
+    # -------------------------------------------------------------- report
+    def _auto_report(self) -> dict[str, Path]:
+        """Transition to the report phase and write markdown + json + html
+        to the session directory. Exceptions are swallowed so a reporting
+        bug can't corrupt a completed scan."""
+        try:
+            from ..reporting import Reporter
+        except Exception as e:
+            logger.debug(f"reporter unavailable: {e}")
+            return {}
+        self.audit.log(
+            "phase_transition",
+            {"from": "exploit", "to": "report", "driver": "session_end"},
+        )
+        try:
+            reporter = Reporter(
+                store=self.store,
+                session_dir=self.session_dir,
+                llm=None,   # final deterministic pass; LLM polish is opt-in via `pentagent report`
+                program_name=getattr(self.scope, "program_name", ""),
+                authorized_by=getattr(self.scope, "authorized_by", ""),
+                authorized_on=getattr(self.scope, "authorized_on", ""),
+                operator=getattr(self.scope, "operator", ""),
+                seed_targets=list(self.seed_targets),
+                session_mode=self.settings.session.mode,
+            )
+            artifacts = reporter.generate(formats=["markdown", "json", "html"])
+            for kind, path in artifacts.items():
+                logger.info(f"[bold cyan]report[/bold cyan] {kind} → {path}")
+            self.audit.log(
+                "report_written",
+                {k: str(v) for k, v in artifacts.items()},
+            )
+            return artifacts
+        except Exception as e:
+            logger.warning(f"[yellow]auto-report failed:[/yellow] {e}")
+            self.audit.log("report_error", {"error": str(e)})
+            return {}
+
+    def _severity_breakdown(self) -> dict[str, int]:
+        counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+        for f in self.store.findings():
+            sev = f.severity.value if hasattr(f.severity, "value") else str(f.severity)
+            counts[sev] = counts.get(sev, 0) + 1
+        return counts
+
+    def _overall_risk_label(self) -> str:
+        b = self._severity_breakdown()
+        for sev in ("critical", "high", "medium", "low"):
+            if b.get(sev, 0) > 0:
+                return sev.upper()
+        return "INFORMATIONAL"
 
     # ---------------------------------------------------------------- batch
     def _execute_batch(self, batch: list[Action]) -> dict[str, int]:
@@ -317,7 +430,8 @@ class Orchestrator:
         for a in batch:
             logger.info(
                 f"[bold]iter {self.budget.iterations + 1}+[/bold] → "
-                f"{a.tool} priority={a.priority} reason={a.reason!r}"
+                f"{a.tool} phase={a.phase().label} "
+                f"priority={a.priority} reason={a.reason!r}"
             )
 
         totals: dict[str, int] = {}
@@ -340,15 +454,57 @@ class Orchestrator:
                     totals[k] = totals.get(k, 0) + v
         return totals
 
+    def _run_cve_enrichment(self) -> None:
+        """Post-batch pass: match current tech against NVD. Findings are
+        committed alongside normal observations so the report consumes them
+        uniformly. Failures are soft — offline runs get zero CVEs, not an
+        exception."""
+        if not self.cve_enricher.enabled:
+            return
+        try:
+            obs, self._cve_seen = enrich_webapps_and_services(
+                self.store, self.cve_enricher, already_seen=self._cve_seen,
+            )
+        except Exception as e:
+            logger.debug(f"cve enrichment pass failed: {e}")
+            return
+        if obs.findings:
+            counts = self.store.commit(obs)
+            logger.info(
+                f"[cyan]  cve-enricher committed[/cyan] {counts['findings']} CVE "
+                f"finding(s) across {counts['evidence']} evidence record(s)"
+            )
+            self.audit.log(
+                "cve_enrichment",
+                {
+                    "committed": {
+                        "findings": counts["findings"],
+                        "evidence": counts["evidence"],
+                    },
+                    "cache_hits_total": len(self._cve_seen),
+                },
+            )
+
     def _run_one(self, action: Action, timeout: int) -> dict[str, int]:
         """Execute a single action: exec → parse → commit → return counts.
         Runs inside the thread pool; must not touch orchestrator mutable
         state directly — only the KnowledgeStore (which locks internally)."""
         result = self.executor.run(action.tool, action.params, timeout=timeout)
+        attack = map_tool(action.tool)
         self.audit.log(
             "iter_summary",
             {
-                "action": {"tool": action.tool, "params": action.params, "reason": action.reason},
+                "action": {
+                    "tool": action.tool,
+                    "phase": action.phase().label,
+                    "params": action.params,
+                    "reason": action.reason,
+                    "mitre": {
+                        "tactic_id": attack["tactic_id"],
+                        "tactic": attack["tactic"],
+                        "techniques": list(attack["techniques"]),
+                    },
+                },
                 "result": result.summary(),
             },
         )

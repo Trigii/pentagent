@@ -228,6 +228,14 @@ def run(
     log_level: str = typer.Option("INFO", "--log-level"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Build orchestrator but do not iterate."),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip LLM planner; pure heuristics."),
+    resume: Path = typer.Option(
+        None,
+        "--resume",
+        help="Resume an existing session directory: reuse its knowledge.db + "
+             "audit.jsonl instead of creating a fresh session. The planner will "
+             "dedupe against actions already recorded, so new work picks up where "
+             "the previous run left off.",
+    ),
 ) -> None:
     """Run the agent against one or more seed targets."""
     console.print(_BANNER, style="bold")
@@ -261,10 +269,23 @@ def run(
             console.print(f"[bold red]scope rejects seed target {t!r}:[/bold red] {e}")
             raise typer.Exit(code=3)
 
-    # Session dir
-    stamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    session_id = f"{stamp}_{secrets.token_hex(3)}"
-    session_dir = Path(settings.output.dir) / session_id
+    # Session dir — either a fresh one or an existing dir being resumed
+    if resume is not None:
+        session_dir = resume
+        if not session_dir.is_dir():
+            console.print(f"[bold red]--resume: session dir not found: {session_dir}[/bold red]")
+            raise typer.Exit(code=2)
+        if not (session_dir / "knowledge.db").exists():
+            console.print(
+                f"[bold red]--resume: no knowledge.db inside {session_dir} — "
+                f"can't resume what doesn't exist[/bold red]"
+            )
+            raise typer.Exit(code=2)
+        console.print(f"[cyan]resuming session[/cyan] {session_dir}")
+    else:
+        stamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        session_id = f"{stamp}_{secrets.token_hex(3)}"
+        session_dir = Path(settings.output.dir) / session_id
 
     # LLM for planner & reporter
     planner_llm = None
@@ -292,7 +313,34 @@ def run(
         summary = orchestrator.run()
     finally:
         orchestrator.close()
-    console.print(f"[bold green]session complete:[/bold green] {summary}")
+
+    # Headline summary — formatted for fast human triage
+    risk = summary.get("overall_risk", "INFORMATIONAL")
+    risk_colour = {
+        "CRITICAL": "bold red",
+        "HIGH": "red",
+        "MEDIUM": "yellow",
+        "LOW": "cyan",
+        "INFORMATIONAL": "dim",
+    }.get(risk, "dim")
+    console.print()
+    console.print(f"[bold green]═══ session complete ═══[/bold green]")
+    console.print(f"  reason: {summary.get('reason', 'unknown')}")
+    console.print(f"  last phase: {summary.get('last_phase', '?')}")
+    console.print(f"  overall risk: [{risk_colour}]{risk}[/{risk_colour}]")
+    sev = summary.get("severity_breakdown", {})
+    if sev:
+        parts = [f"{k}={v}" for k, v in sev.items() if v]
+        if parts:
+            console.print(f"  findings: {', '.join(parts)}")
+    console.print(
+        f"  graph: {summary.get('hosts', 0)} host(s), "
+        f"{summary.get('endpoints', 0)} endpoint(s), "
+        f"{summary.get('findings', 0)} finding(s)"
+    )
+    for kind, p in (summary.get("report_artifacts") or {}).items():
+        console.print(f"  deterministic {kind}: [dim]{p}[/dim]")
+    console.print()
 
     # Auto-generate report
     reporter_llm = None
@@ -303,7 +351,17 @@ def run(
             pass
     from .memory import KnowledgeStore
     store = KnowledgeStore(session_dir / "knowledge.db")
-    reporter = Reporter(store=store, session_dir=session_dir, llm=reporter_llm)
+    reporter = Reporter(
+        store=store,
+        session_dir=session_dir,
+        llm=reporter_llm,
+        program_name=scope_obj.program_name or "",
+        authorized_by=scope_obj.authorized_by or "",
+        authorized_on=scope_obj.authorized_on or "",
+        operator=scope_obj.operator or "",
+        seed_targets=list(target),
+        session_mode=settings.session.mode,
+    )
     written = reporter.generate(formats=settings.output.report_format)
     for kind, p in written.items():
         console.print(f"[bold]report[/bold] ({kind}): {p}")
@@ -314,7 +372,13 @@ def run(
 def report(
     session: Path = typer.Option(..., "--session", "-s"),
     config: Path = typer.Option("config/config.yaml", "--config", "-c"),
+    scope: Path = typer.Option(None, "--scope", help="Optional scope file to stamp the report header."),
     no_llm: bool = typer.Option(False, "--no-llm"),
+    formats: str = typer.Option(
+        "",
+        "--formats",
+        help="Comma-separated output formats (markdown,json,html). Default from config.",
+    ),
 ) -> None:
     """Re-generate the report for an existing session."""
     configure_logging("INFO")
@@ -325,13 +389,159 @@ def report(
             llm = build_client("reporter", settings.llm)
         except Exception as e:
             console.print(f"[yellow]LLM unavailable ({e})[/yellow]")
+    scope_obj = Scope.load(scope) if scope else None
     from .memory import KnowledgeStore
     store = KnowledgeStore(session / "knowledge.db")
-    reporter = Reporter(store=store, session_dir=session, llm=llm)
-    written = reporter.generate(formats=settings.output.report_format)
+    reporter = Reporter(
+        store=store,
+        session_dir=session,
+        llm=llm,
+        program_name=(scope_obj.program_name if scope_obj else "") or "",
+        authorized_by=(scope_obj.authorized_by if scope_obj else "") or "",
+        authorized_on=(scope_obj.authorized_on if scope_obj else "") or "",
+        operator=(scope_obj.operator if scope_obj else "") or "",
+        session_mode=settings.session.mode,
+    )
+    fmt_list = [f.strip() for f in formats.split(",") if f.strip()] or settings.output.report_format
+    written = reporter.generate(formats=fmt_list)
     for kind, p in written.items():
         console.print(f"[bold]{kind}[/bold]: {p}")
     store.close()
+
+
+@app.command()
+def status(session: Path = typer.Argument(..., help="path to a session directory")) -> None:
+    """Print a dashboard summary of a completed or in-flight session.
+
+    Read-only: inspects knowledge.db + audit.jsonl + report artifacts and
+    reports overall risk, severity breakdown, tool inventory, phase
+    progression, and elapsed time. Handy for reviewing a past run without
+    re-running anything.
+    """
+    import json as _json
+    from collections import Counter
+    if not session.exists() or not session.is_dir():
+        console.print(f"[red]session dir not found: {session}[/red]")
+        raise typer.Exit(code=1)
+
+    kdb = session / "knowledge.db"
+    audit_path = session / "audit.jsonl"
+    if not kdb.exists():
+        console.print(f"[red]no knowledge.db at {kdb}[/red]")
+        raise typer.Exit(code=1)
+
+    from .memory import KnowledgeStore
+    store = KnowledgeStore(kdb)
+    try:
+        hosts = store.hosts()
+        webapps = store.webapps()
+        endpoints = store.endpoints()
+        services = store.services()
+        findings = store.findings()
+    finally:
+        store.close()
+
+    # Severity breakdown
+    sev_counts: Counter[str] = Counter()
+    for f in findings:
+        v = f.severity.value if hasattr(f.severity, "value") else str(f.severity)
+        sev_counts[v] += 1
+    overall = "INFORMATIONAL"
+    for s in ("critical", "high", "medium", "low"):
+        if sev_counts.get(s, 0) > 0:
+            overall = s.upper()
+            break
+    risk_colour = {
+        "CRITICAL": "bold red",
+        "HIGH": "red",
+        "MEDIUM": "yellow",
+        "LOW": "cyan",
+        "INFORMATIONAL": "dim",
+    }.get(overall, "dim")
+
+    # Audit timeline → tool runs + phase transitions + session bounds
+    tool_counts: Counter[str] = Counter()
+    phases_seen: list[str] = []
+    session_start = None
+    session_end = None
+    session_reason = None
+    if audit_path.exists():
+        for line in audit_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = _json.loads(line)
+            except Exception:
+                continue
+            evt = rec.get("event", "")
+            data = rec.get("data", {})
+            if evt == "session_start":
+                session_start = rec.get("ts") or data.get("ts")
+            elif evt == "session_end":
+                session_end = rec.get("ts") or data.get("ts")
+                session_reason = data.get("reason")
+            elif evt == "iter_summary":
+                tool = (data.get("action") or {}).get("tool", "")
+                if tool:
+                    tool_counts[tool] += 1
+            elif evt == "phase_transition":
+                to_ph = data.get("to", "")
+                if to_ph and (not phases_seen or phases_seen[-1] != to_ph):
+                    phases_seen.append(to_ph)
+
+    # Render
+    console.print()
+    console.print(f"[bold green]═══ session status: {session.name} ═══[/bold green]")
+    console.print(f"  overall risk: [{risk_colour}]{overall}[/{risk_colour}]")
+    if sev_counts:
+        parts = [f"{k}={v}" for k, v in sev_counts.items() if v]
+        if parts:
+            console.print(f"  findings: {', '.join(parts)}")
+    console.print(
+        f"  graph: {len(hosts)} host(s), {len(webapps)} webapp(s), "
+        f"{len(endpoints)} endpoint(s), {len(services)} service(s), "
+        f"{len(findings)} finding(s)"
+    )
+    if phases_seen:
+        console.print(f"  phases: {' → '.join(phases_seen)}")
+    if tool_counts:
+        console.print(f"  tool inventory:")
+        for tool, n in tool_counts.most_common():
+            console.print(f"    [dim]•[/dim] {tool:<12} [cyan]{n}[/cyan]")
+    if session_start and session_end:
+        try:
+            elapsed = float(session_end) - float(session_start)
+            console.print(f"  elapsed: {elapsed/60:.1f} minute(s)")
+        except Exception:
+            pass
+    if session_reason:
+        console.print(f"  stop reason: {session_reason}")
+
+    # Report artifacts
+    artifacts = []
+    for kind, name in [("markdown", "report.md"), ("json", "report.json"), ("html", "report.html")]:
+        p = session / name
+        if p.exists():
+            artifacts.append((kind, p))
+    if artifacts:
+        console.print(f"  report artifacts:")
+        for kind, p in artifacts:
+            console.print(f"    [dim]•[/dim] {kind:<8} [dim]{p}[/dim]")
+    else:
+        console.print(f"  [dim]no report artifacts — run `pentagent report --session {session}` to generate[/dim]")
+
+    # Top-3 findings preview
+    if findings:
+        _sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        top = sorted(findings, key=lambda f: (
+            _sev_order.get(f.severity.value if hasattr(f.severity, "value") else str(f.severity), 99),
+            -f.confidence,
+        ))[:3]
+        console.print(f"  top findings:")
+        for f in top:
+            sev = f.severity.value if hasattr(f.severity, "value") else str(f.severity)
+            console.print(f"    [dim]•[/dim] [{sev.upper()}] {f.title}")
+    console.print()
 
 
 @app.command("verify-audit")
