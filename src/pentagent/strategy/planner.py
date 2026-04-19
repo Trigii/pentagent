@@ -31,6 +31,18 @@ from .heuristics import HeuristicPlanner
 logger = get_logger(__name__)
 
 
+def _known_tools() -> set[str]:
+    """The set of tool names the executor will accept. Lazy import so the
+    strategy package doesn't depend on tools/ at import time — this keeps
+    dependency-free tests lean. Returns empty set if tools unavailable,
+    which collapses to a no-op filter (the executor will catch it)."""
+    try:
+        from ..tools import default_registry
+        return set(default_registry.names())
+    except Exception:
+        return set()
+
+
 def _executed_signatures(store: KnowledgeStore) -> set[str]:
     """Read action_log and return the set of signatures already run, so
     re-proposals can be rejected. Uses canonical target extraction so
@@ -113,8 +125,12 @@ class LLMPlanner:
         # New actions the LLM proposed (must be in the closed tool vocab).
         # Reject any whose signature already ran or duplicates an existing
         # candidate's signature — this is what prevents the nuclei loop.
+        # Also reject hallucinated tool names (e.g. "dirsearch") that aren't
+        # registered — otherwise the executor bounces them and we lose a
+        # thread-pool slot to a guaranteed failure.
         executed = _executed_signatures(store)
         existing_sigs = {a.signature() for a in ranked}
+        known_tools = _known_tools()
         for na in parsed.get("new_actions") or []:
             if not isinstance(na, dict):
                 continue
@@ -128,6 +144,12 @@ class LLMPlanner:
                     parser_context=dict(na.get("parser_context") or {}),
                 )
             except Exception:
+                continue
+            if known_tools and a.tool not in known_tools:
+                logger.info(
+                    f"llm new_action rejected: tool {a.tool!r} is not registered "
+                    f"(known: {sorted(known_tools)})"
+                )
                 continue
             sig = a.signature()
             if not sig:

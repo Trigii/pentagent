@@ -16,6 +16,90 @@ _SEVERITY_MAP = {
     "unknown": Severity.info,
 }
 
+# Severity is a (str, Enum) so .value is a string — we need an explicit
+# rank for ordered comparisons in the escalator.
+_SEV_RANK: dict[Severity, int] = {
+    Severity.info: 0,
+    Severity.low: 1,
+    Severity.medium: 2,
+    Severity.high: 3,
+    Severity.critical: 4,
+}
+
+
+def _bump(current: Severity, floor: Severity) -> Severity:
+    """Return max(current, floor) by severity rank. Never downgrades."""
+    return current if _SEV_RANK[current] >= _SEV_RANK[floor] else floor
+
+# Template-id substrings that indicate a high-value exposure. Nuclei files
+# these as "info" by default, but for pentest triage they're chase-worthy —
+# an admin/login panel is a credentialed-attack surface, and exposed service
+# consoles (flowise, grafana, kibana, jenkins, rabbitmq, etc.) are routinely
+# the shortest path to compromise. We bump info→medium for these so they
+# don't get lost in the info noise in the final report.
+_HIGH_VALUE_TEMPLATE_PATTERNS: tuple[str, ...] = (
+    # Management/admin consoles
+    "admin-panel",
+    "exposed-panel",
+    "login-panel",
+    "flowise-panel",
+    "grafana-detect",
+    "kibana-detect",
+    "jenkins-",
+    "rabbitmq-",
+    "kubernetes-dashboard",
+    "portainer",
+    "phpmyadmin",
+    "wp-login",
+    # Exposed VCS / backups / env
+    "exposed-git",
+    ".git-config",
+    ".env-file",
+    "exposed-backup",
+    "exposed-sql",
+    # Default creds / weak auth templates ship as info but are high-value
+    "default-login",
+    "default-credential",
+)
+
+# Substrings that should escalate to HIGH regardless of nuclei's label.
+# These represent direct-impact exposures where severity=info is just wrong.
+_CRITICAL_TEMPLATE_PATTERNS: tuple[str, ...] = (
+    "exposed-git-config",
+    ".git-config-exposed",
+    "env-file-exposed",
+    "aws-credentials",
+    "private-key-exposed",
+)
+
+
+def _escalate_severity(template_id: str | None, tags: list[str] | None, sev: Severity) -> Severity:
+    """Bump severity for high-value fingerprint templates that nuclei files
+    as info. We only escalate upward, and only when the current severity is
+    below the target — a template that nuclei already rates high/critical is
+    left alone."""
+    if not template_id:
+        return sev
+    tid = template_id.lower()
+    tag_set = {t.lower() for t in (tags or []) if isinstance(t, str)}
+
+    # Critical-path exposures (secrets, configs leaking creds)
+    if any(p in tid for p in _CRITICAL_TEMPLATE_PATTERNS):
+        return _bump(sev, Severity.high)
+
+    # High-value recon hits: admin consoles, login portals, exposed services
+    if any(p in tid for p in _HIGH_VALUE_TEMPLATE_PATTERNS):
+        return _bump(sev, Severity.medium)
+
+    # Tag-based fallback: nuclei templates often tag `panel`+`exposure` or
+    # `login`+`default-login`. Catch what the substring list misses.
+    if "exposure" in tag_set and ("panel" in tag_set or "config" in tag_set):
+        return _bump(sev, Severity.medium)
+    if "default-login" in tag_set:
+        return _bump(sev, Severity.medium)
+
+    return sev
+
 
 def parse(result: ToolResult, context: dict) -> Observation:
     obs = Observation(source_tool="nuclei", raw_excerpt=result.stdout[:4000])
@@ -33,8 +117,12 @@ def parse(result: ToolResult, context: dict) -> Observation:
             continue
 
         info = rec.get("info") or {}
-        severity = _SEVERITY_MAP.get(str(info.get("severity", "info")).lower(), Severity.info)
+        raw_severity = _SEVERITY_MAP.get(str(info.get("severity", "info")).lower(), Severity.info)
         template_id = rec.get("template-id") or rec.get("templateID")
+        tags = info.get("tags")
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",") if t.strip()]
+        severity = _escalate_severity(template_id, tags if isinstance(tags, list) else None, raw_severity)
         name = info.get("name") or template_id or "nuclei finding"
         description = info.get("description") or ""
         remediation = info.get("remediation") or ""

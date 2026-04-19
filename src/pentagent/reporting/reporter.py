@@ -164,6 +164,7 @@ class Reporter:
             })
 
         attack_path = self._attack_path(findings_block, tool_runs)
+        coverage = self._coverage_gaps(tool_runs, hosts, webapps, endpoints)
 
         return {
             "meta": {
@@ -199,7 +200,125 @@ class Reporter:
             "findings": findings_block,
             "mitre_matrix": techniques,
             "attack_path": attack_path,
+            "coverage_gaps": coverage,
             "tool_inventory": _tool_inventory(tool_runs),
+        }
+
+    def _coverage_gaps(
+        self,
+        tool_runs: list[dict[str, Any]],
+        hosts: list,
+        webapps: list,
+        endpoints: list,
+    ) -> dict[str, Any]:
+        """Identify entities the agent *didn't* probe fully.
+
+        This is the single most-requested reviewer signal — "did we actually
+        look at everything?". We compute per-entity coverage against a small
+        matrix of expected tool runs:
+
+          - Host with no services → nmap never landed results
+          - WebApp with no nuclei run → vuln sweep missing
+          - WebApp with no content discovery → ffuf/gobuster/katana missing
+          - Endpoint with query params + aggressive mode → sqlmap missing
+
+        Each gap is actionable: a reviewer can re-run with explicit
+        --target-include or enable the relevant tool and continue.
+        """
+        # Bucket tool runs by (tool, webapp_id / host target / endpoint_id)
+        runs_by_tool: dict[str, set] = {}
+        for tr in tool_runs:
+            # Skip failed runs (exit_code==-1 marker from dead-tool handler)
+            # — a gap is valid if the tool never *succeeded*, regardless of
+            # whether we tried and failed.
+            if tr.get("exit_code") == -1:
+                continue
+            p = tr.get("params") or {}
+            tool = tr["tool"]
+            bucket = runs_by_tool.setdefault(tool, set())
+            for key in ("webapp_id", "endpoint_id"):
+                if key in p:
+                    bucket.add(("id", int(p[key])))
+            tgt = p.get("target") or p.get("targets")
+            if isinstance(tgt, list):
+                for t in tgt:
+                    bucket.add(("tgt", str(t)))
+            elif isinstance(tgt, str):
+                bucket.add(("tgt", tgt))
+
+        missing_nmap: list[dict[str, Any]] = []
+        missing_nuclei: list[dict[str, Any]] = []
+        missing_content: list[dict[str, Any]] = []
+        missing_sqlmap: list[dict[str, Any]] = []
+
+        # --- Hosts without a successful nmap ---
+        nmap_keys = runs_by_tool.get("nmap", set())
+        host_with_services = {h.id for h in hosts if any(
+            getattr(s, "host_id", None) == h.id for s in self.store.services()
+        )}
+        for h in hosts:
+            if h.id in host_with_services:
+                continue
+            key = h.hostname or h.ip or ""
+            if not key:
+                continue
+            if ("tgt", key) in nmap_keys:
+                continue  # nmap tried but found no services
+            missing_nmap.append({
+                "host": key,
+                "ip": h.ip,
+                "hostname": h.hostname,
+                "reason": "no successful port scan",
+            })
+
+        # --- WebApps without nuclei ---
+        nuclei_keys = runs_by_tool.get("nuclei", set())
+        content_tools = ("ffuf", "gobuster", "katana")
+        content_keys: set = set()
+        for ct in content_tools:
+            content_keys |= runs_by_tool.get(ct, set())
+
+        for w in webapps:
+            if w.id is None:
+                continue
+            if ("id", int(w.id)) not in nuclei_keys:
+                missing_nuclei.append({
+                    "webapp_id": w.id,
+                    "base_url": w.base_url,
+                    "reason": "no nuclei vuln sweep",
+                })
+            if ("id", int(w.id)) not in content_keys:
+                missing_content.append({
+                    "webapp_id": w.id,
+                    "base_url": w.base_url,
+                    "reason": "no content discovery (ffuf/gobuster/katana)",
+                })
+
+        # --- Endpoints with params but no sqlmap (aggressive-mode only) ---
+        if self.session_mode in ("aggressive", "ctf"):
+            sqlmap_keys = runs_by_tool.get("sqlmap", set())
+            for e in endpoints:
+                if not ("?" in e.path or getattr(e, "params", None)):
+                    continue
+                if ("id", int(e.id)) in sqlmap_keys:
+                    continue
+                missing_sqlmap.append({
+                    "endpoint_id": e.id,
+                    "path": e.path,
+                    "reason": "parameterized but sqlmap never ran",
+                })
+
+        return {
+            "missing_nmap": missing_nmap,
+            "missing_nuclei": missing_nuclei,
+            "missing_content_discovery": missing_content,
+            "missing_sqlmap": missing_sqlmap,
+            "totals": {
+                "hosts_without_portscan": len(missing_nmap),
+                "webapps_without_vuln_sweep": len(missing_nuclei),
+                "webapps_without_content_discovery": len(missing_content),
+                "parameterized_endpoints_without_sqlmap": len(missing_sqlmap),
+            },
         }
 
     def _load_action_log(self) -> list[dict[str, Any]]:
@@ -537,6 +656,59 @@ class Reporter:
                         f"{f['title']} — `{f['target']}`"
                     )
             lines.append("")
+
+        # --- Coverage Gaps ---
+        cov = d.get("coverage_gaps") or {}
+        totals = cov.get("totals") or {}
+        if cov and any(totals.values()):
+            lines.append("## Coverage Gaps\n")
+            lines.append(
+                "_Entities in scope that were discovered but not fully "
+                "probed. Each row is a candidate for a follow-up run._\n"
+            )
+            lines.append("| Category | Count |")
+            lines.append("|---|---:|")
+            for label, key in (
+                ("Hosts without port scan", "hosts_without_portscan"),
+                ("WebApps without vuln sweep", "webapps_without_vuln_sweep"),
+                ("WebApps without content discovery", "webapps_without_content_discovery"),
+                ("Parameterized endpoints without sqlmap", "parameterized_endpoints_without_sqlmap"),
+            ):
+                if totals.get(key):
+                    lines.append(f"| {label} | {totals[key]} |")
+            lines.append("")
+
+            if cov.get("missing_nmap"):
+                lines.append("### Hosts not port-scanned\n")
+                for h in cov["missing_nmap"][:20]:
+                    lines.append(f"- `{h['host']}` — {h['reason']}")
+                if len(cov["missing_nmap"]) > 20:
+                    lines.append(f"- _…and {len(cov['missing_nmap']) - 20} more_")
+                lines.append("")
+
+            if cov.get("missing_nuclei"):
+                lines.append("### WebApps without vuln sweep\n")
+                for w in cov["missing_nuclei"][:20]:
+                    lines.append(f"- `{w['base_url']}` (id={w['webapp_id']})")
+                if len(cov["missing_nuclei"]) > 20:
+                    lines.append(f"- _…and {len(cov['missing_nuclei']) - 20} more_")
+                lines.append("")
+
+            if cov.get("missing_content_discovery"):
+                lines.append("### WebApps without content discovery\n")
+                for w in cov["missing_content_discovery"][:20]:
+                    lines.append(f"- `{w['base_url']}` (id={w['webapp_id']})")
+                if len(cov["missing_content_discovery"]) > 20:
+                    lines.append(f"- _…and {len(cov['missing_content_discovery']) - 20} more_")
+                lines.append("")
+
+            if cov.get("missing_sqlmap"):
+                lines.append("### Parameterized endpoints skipped by sqlmap\n")
+                for e in cov["missing_sqlmap"][:20]:
+                    lines.append(f"- `{e['path']}` (endpoint_id={e['endpoint_id']})")
+                if len(cov["missing_sqlmap"]) > 20:
+                    lines.append(f"- _…and {len(cov['missing_sqlmap']) - 20} more_")
+                lines.append("")
 
         # --- Appendix ---
         lines.append("## Appendix: Tool Inventory\n")

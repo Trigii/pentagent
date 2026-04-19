@@ -33,6 +33,7 @@ from ..config import Settings
 from ..memory import KnowledgeStore
 from ..safety import Scope
 from .actions import Action, ActionPriority
+from .followups import synthesize as _synthesize_followups
 
 
 # -- wordlists used for the "try harder" ladder --------------------------------
@@ -455,6 +456,24 @@ class HeuristicPlanner:
                         priority=ActionPriority.critical,
                     )
                 )
+
+        # -----------------------------------------------------------------
+        # 11. Finding-driven follow-ups. A panel/exposure/CVE finding is
+        #     a high-signal cue the baseline loop ignores (it only reads
+        #     graph state). Synthesize targeted next steps here so the
+        #     agent chains: `nuclei` → `nuclei -tags flowise` →  etc.
+        #
+        #     The heuristic baseline above already proposed a catch-all
+        #     nuclei run on every WebApp. Signatures for tag-targeted
+        #     follow-ups differ (targets+tags in the canonical params) so
+        #     these don't dedupe against the catch-all.
+        # -----------------------------------------------------------------
+        try:
+            findings = store.findings()
+        except Exception:
+            findings = []
+        if findings:
+            out.extend(_synthesize_followups(findings, webapps))
 
         # Phase-aware ordering: earlier phase wins, ties broken by priority.
         out.sort(key=lambda a: a.sort_key())

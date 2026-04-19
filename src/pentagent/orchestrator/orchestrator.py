@@ -145,6 +145,12 @@ class Orchestrator:
         # Per-session dedup so we don't re-file the same CVE finding each iter
         self._cve_seen: set[str] = set()
 
+        # Tools whose binary is missing get marked dead for the rest of the
+        # session. Otherwise the planner proposes them every iteration, we
+        # burn a thread-pool slot to fail fast, and the log fills with
+        # identical warnings. Stops the "katana failed x6" noise.
+        self._dead_tools: set[str] = set()
+
         # Authorization banner — burned into the audit log
         self.audit.log(
             "session_start",
@@ -295,17 +301,24 @@ class Orchestrator:
 
                 # Pick a batch of signature-distinct candidates to run in
                 # parallel. Planner already dedupes against the action_log;
-                # this extra pass keeps sibling duplicates from sneaking in.
+                # this extra pass keeps sibling duplicates from sneaking in
+                # AND filters out tools we've proved dead this session.
                 batch: list[Action] = []
                 sigs: set[str] = set()
+                skipped_dead: list[str] = []
                 for a in candidates:
                     if len(batch) >= self.parallel_actions:
                         break
+                    if a.tool in self._dead_tools:
+                        skipped_dead.append(a.tool)
+                        continue
                     s = a.signature()
                     if s in sigs:
                         continue
                     sigs.add(s)
                     batch.append(a)
+                if skipped_dead:
+                    logger.debug(f"skipped dead tools: {sorted(set(skipped_dead))}")
 
                 iter_start_total = len(self.store.hosts()) + len(self.store.webapps()) + \
                                    len(self.store.endpoints()) + len(self.store.findings()) + \
@@ -445,10 +458,44 @@ class Orchestrator:
                 try:
                     counts = fut.result()
                 except Exception as e:
-                    logger.warning(f"[yellow]{a.tool} failed:[/yellow] {e}")
+                    err_msg = str(e)
+                    logger.warning(f"[yellow]{a.tool} failed:[/yellow] {err_msg}")
                     self.audit.log(
-                        "iter_error", {"action": {"tool": a.tool, "params": a.params}, "error": str(e)}
+                        "iter_error", {"action": {"tool": a.tool, "params": a.params}, "error": err_msg}
                     )
+                    # Permanent failures: mark the tool dead so we stop
+                    # re-proposing it. Anything involving missing binaries,
+                    # unknown tools, or unsupported modes is never going to
+                    # fix itself mid-session.
+                    lowered = err_msg.lower()
+                    if any(phrase in lowered for phrase in (
+                        "not found in path", "unknown tool", "does not support mode",
+                    )):
+                        if a.tool not in self._dead_tools:
+                            self._dead_tools.add(a.tool)
+                            logger.info(
+                                f"[dim]  {a.tool} marked dead for session "
+                                f"(will not be re-proposed)[/dim]"
+                            )
+                            self.audit.log(
+                                "tool_dead",
+                                {"tool": a.tool, "reason": err_msg},
+                            )
+                    # Record the attempt in the action log so signature dedupe
+                    # catches it too — belt-and-suspenders defense against
+                    # LLM re-proposals with slightly different params.
+                    try:
+                        import json as _json, time as _t
+                        self.store.record_action(
+                            tool=a.tool,
+                            params_json=_json.dumps(a.params, sort_keys=True, default=str),
+                            started_at=_t.time(),
+                            finished_at=_t.time(),
+                            exit_code=-1,
+                            cache_key=f"FAILED::{a.tool}::{a.signature()}",
+                        )
+                    except Exception:
+                        pass
                     continue
                 for k, v in counts.items():
                     totals[k] = totals.get(k, 0) + v

@@ -409,6 +409,97 @@ FINDING_MAPPING: dict[str, FindingStandards] = {
     "no-logging": FindingStandards(
         cwe="CWE-778", owasp_2021="A09:2021 – Security Logging and Monitoring Failures",
     ),
+
+    # -----------------------------------------------------------
+    # Nuclei template families seen in real runs — map to the
+    # nearest OWASP/CWE bucket so the report has real taxonomy
+    # instead of empty standards columns.
+    # -----------------------------------------------------------
+
+    # Technology / version fingerprinting: informational surface
+    # area, maps to "outdated components" if EOL is detected.
+    "tech-detect": FindingStandards(
+        cwe="CWE-200", owasp_2021="A05:2021 – Security Misconfiguration",
+        description="Technology fingerprint disclosed in response",
+    ),
+    "nginx-version": FindingStandards(
+        cwe="CWE-200", owasp_2021="A05:2021 – Security Misconfiguration",
+        attack_technique="T1592.002",
+        description="Server version leaked in response header",
+    ),
+    "nginx-eol": FindingStandards(
+        cwe="CWE-1104", owasp_2021="A06:2021 – Vulnerable and Outdated Components",
+        attack_technique="T1190",
+        description="Server reached end-of-life — no more security updates",
+    ),
+    "openssh-detect": FindingStandards(
+        cwe="CWE-200", owasp_2021="A05:2021 – Security Misconfiguration",
+        attack_technique="T1592.002",
+        description="SSH service software fingerprint leaked",
+    ),
+    "ssh-server-enumeration": FindingStandards(
+        cwe="CWE-200", owasp_2021="A05:2021 – Security Misconfiguration",
+        attack_technique="T1592.002",
+    ),
+    "ssh-auth-methods": FindingStandards(
+        cwe="CWE-200", owasp_2021="A07:2021 – Identification and Authentication Failures",
+        attack_technique="T1595",
+        description="SSH authentication methods enumerable",
+    ),
+    "ssh-password-auth": FindingStandards(
+        cwe="CWE-308", owasp_2021="A07:2021 – Identification and Authentication Failures",
+        attack_technique="T1110.001",
+        description="SSH password authentication enabled — brute-force surface",
+    ),
+    "ssh-sha1-hmac-algo": FindingStandards(
+        cwe="CWE-327", owasp_2021="A02:2021 – Cryptographic Failures",
+        description="SSH server supports SHA-1 HMAC (deprecated)",
+    ),
+
+    # HTTP hygiene
+    "waf-detect": FindingStandards(
+        cwe="CWE-200", owasp_2021="A05:2021 – Security Misconfiguration",
+        description="WAF identified via response fingerprint",
+    ),
+    "http-missing-security-headers": FindingStandards(
+        cwe="CWE-693", owasp_2021="A05:2021 – Security Misconfiguration",
+        description="Response lacks hardening headers (CSP/HSTS/X-Frame-Options/...)",
+    ),
+    "missing-sri": FindingStandards(
+        cwe="CWE-353", owasp_2021="A08:2021 – Software and Data Integrity Failures",
+        description="External script/stylesheet lacks subresource-integrity hash",
+    ),
+    "cors-misconfig": FindingStandards(
+        cwe="CWE-942", owasp_2021="A05:2021 – Security Misconfiguration",
+        attack_technique="T1190",
+        description="CORS policy permits untrusted origins",
+    ),
+    "caa-fingerprint": FindingStandards(
+        cwe="CWE-200", owasp_2021="A05:2021 – Security Misconfiguration",
+        description="DNS CAA record reveals issuing CA posture",
+    ),
+
+    # Exposed admin / workflow panels — if reachable they are
+    # launchpads for credential abuse and data exfil.
+    "flowise-panel": FindingStandards(
+        cwe="CWE-284", owasp_2021="A01:2021 – Broken Access Control",
+        attack_technique="T1190",
+        description="Flowise LLM workflow console exposed — may leak API keys + datasource creds",
+    ),
+    "admin-panel": FindingStandards(
+        cwe="CWE-284", owasp_2021="A01:2021 – Broken Access Control",
+        attack_technique="T1190",
+        description="Administrative interface reachable without authentication",
+    ),
+    "exposed-panel": FindingStandards(
+        cwe="CWE-284", owasp_2021="A01:2021 – Broken Access Control",
+        attack_technique="T1190",
+        description="Internal/administrative panel exposed to the internet",
+    ),
+    "login-panel": FindingStandards(
+        cwe="CWE-284", owasp_2021="A07:2021 – Identification and Authentication Failures",
+        description="Login page fingerprint — credential-spray target",
+    ),
 }
 
 
@@ -431,6 +522,26 @@ def map_finding(kind: str) -> dict[str, Any]:
             fs = FINDING_MAPPING["xss"]
         elif "traversal" in k:
             fs = FINDING_MAPPING["path-traversal"]
+        # Nuclei template family fallbacks — a template named e.g.
+        # "apache-airflow-panel" should resolve to exposed-panel.
+        elif "panel" in k or "-console" in k or "-dashboard" in k:
+            fs = FINDING_MAPPING["exposed-panel"]
+        elif "login" in k and k != "login-panel":
+            fs = FINDING_MAPPING["login-panel"]
+        elif "cors" in k:
+            fs = FINDING_MAPPING["cors-misconfig"]
+        elif "security-header" in k or "missing-header" in k:
+            fs = FINDING_MAPPING["http-missing-security-headers"]
+        elif "eol" in k or "end-of-life" in k:
+            fs = FINDING_MAPPING["nginx-eol"]
+        elif k.startswith("ssh-") or "openssh" in k:
+            fs = FINDING_MAPPING.get("openssh-detect")
+        elif "waf" in k:
+            fs = FINDING_MAPPING["waf-detect"]
+        elif "tech-detect" in k or "technology" in k or "wappalyzer" in k:
+            fs = FINDING_MAPPING["tech-detect"]
+        elif k.startswith("cve-") or k == "cve":
+            fs = FINDING_MAPPING["cve"]
     if not fs:
         return {"cwe": "", "owasp_2021": "", "attack_technique": "", "description": ""}
     return {
