@@ -35,6 +35,12 @@ def _canonical_target(params: dict[str, Any]) -> str:
     lowercase it, strip scheme and trailing slashes so http://x.com/ and
     x.com collapse. For multi-target tools (list of URLs/hosts), we sort
     and join so order doesn't matter.
+
+    A *facet* suffix may be appended when the action qualifies its target
+    with a tag-set, service port, or vuln-class — so that a generic
+    nuclei sweep and a tag-targeted follow-up against the same URL land
+    on distinct signatures. Without this, the planner would collapse the
+    tag-targeted runs into the catch-all and skip them.
     """
     def _one(v: Any) -> str:
         s = str(v).strip().lower().rstrip("/")
@@ -45,23 +51,54 @@ def _canonical_target(params: dict[str, Any]) -> str:
             return (host + path).rstrip("/")
         return s
 
-    # Single-target keys, in priority order
+    # Compute the primary target.
+    target = ""
     for key in ("url", "target", "domain", "host"):
         v = params.get(key)
         if isinstance(v, str) and v:
-            return _one(v)
+            target = _one(v)
+            break
+    if not target:
+        v = params.get("targets")
+        if isinstance(v, (list, tuple)) and v:
+            target = ",".join(sorted({_one(x) for x in v if x}))
+    if not target:
+        for key in ("webapp_id", "endpoint_id", "host_id"):
+            if key in params:
+                target = f"{key}={params[key]}"
+                break
+    if not target:
+        return ""
 
-    # Multi-target keys
-    v = params.get("targets")
-    if isinstance(v, (list, tuple)) and v:
-        return ",".join(sorted({_one(x) for x in v if x}))
+    # Compute the facet suffix. A handful of keys split the target into
+    # distinct runs: vuln_class, tags, service_port. Priority order
+    # matters (most-specific first).
+    facet_parts: list[str] = []
+    vc = params.get("vuln_class")
+    if isinstance(vc, str) and vc:
+        facet_parts.append(f"class={vc.lower()}")
+    else:
+        tags = params.get("tags")
+        if isinstance(tags, str) and tags:
+            # Normalize tag order so permutations collapse.
+            norm = ",".join(sorted({t.strip().lower() for t in tags.split(",") if t.strip()}))
+            if norm:
+                facet_parts.append(f"tags={norm}")
+        elif isinstance(tags, (list, tuple)) and tags:
+            norm = ",".join(sorted({str(t).strip().lower() for t in tags if str(t).strip()}))
+            if norm:
+                facet_parts.append(f"tags={norm}")
+    sp = params.get("service_port")
+    if sp is not None:
+        facet_parts.append(f"port={sp}")
+    # Scan profile (e.g. nmap "deep" vs. initial discovery)
+    sprof = params.get("scan_profile")
+    if isinstance(sprof, str) and sprof:
+        facet_parts.append(f"profile={sprof.lower()}")
 
-    # Fall back to entity-id hints (e.g. webapp_id=42)
-    for key in ("webapp_id", "endpoint_id", "host_id"):
-        if key in params:
-            return f"{key}={params[key]}"
-
-    return ""
+    if facet_parts:
+        return f"{target}:{'|'.join(facet_parts)}"
+    return target
 
 
 @dataclass

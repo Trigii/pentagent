@@ -255,6 +255,113 @@ class Orchestrator:
             f"{counts['webapps']} webapp(s) in graph"
         )
 
+    # ---------------------------------------------------------- passive recon
+    def _passive_recon(self) -> None:
+        """Pre-planner sweep: enumerate subdomains via crt.sh and DNS for
+        every seed apex, and register the in-scope ones as Host rows.
+
+        This is step 1 of the standard pentesting methodology ("passive
+        information gathering"). Runs before the planner's first tick so
+        the graph already carries the full apex surface when tools like
+        httpx/nmap are considered. Anything out-of-scope is silently
+        skipped — we don't emit `observed only` rows here because the
+        seed bootstrap already covers the canonical targets.
+
+        Entirely best-effort: crt.sh unreachable or DNS timing out is a
+        no-op. Cache lives next to the session so re-runs are cheap.
+        """
+        from ..enrichment import passive_recon
+        from urllib.parse import urlparse
+
+        cache_dir = self.session_dir / "passive_recon_cache"
+
+        # Collect unique apex domains from seeds (strip IPs/ports/schemes)
+        import ipaddress as _ip
+        apexes: list[str] = []
+        seen: set[str] = set()
+        for t in self.seed_targets:
+            t = t.strip()
+            if not t:
+                continue
+            host = urlparse(t).hostname if "://" in t else (
+                t.split("/", 1)[0].split(":", 1)[0]
+            )
+            host = (host or "").lower()
+            if not host or "." not in host:
+                continue
+            try:
+                _ip.ip_address(host)
+                continue  # skip bare IPs — crt.sh takes domains
+            except ValueError:
+                pass
+            if host in seen:
+                continue
+            seen.add(host)
+            apexes.append(host)
+
+        if not apexes:
+            return
+
+        obs = Observation(
+            source_tool="passive-recon",
+            notes="crt.sh + DNS enumeration of seed apex domains",
+        )
+        seen_host_keys: set[tuple[str, str]] = set()
+        in_scope_subs = 0
+        oos_subs = 0
+        total_ips = 0
+
+        for apex in apexes:
+            try:
+                result = passive_recon.enumerate_domain(apex, cache_dir=cache_dir)
+            except Exception as e:
+                logger.debug(f"passive recon failed for {apex}: {e}")
+                continue
+            for sub in result.subdomains:
+                in_scope = False
+                try:
+                    self.scope_guard.check(sub)
+                    in_scope = True
+                except ScopeViolation:
+                    oos_subs += 1
+                    continue
+                if not in_scope:
+                    continue
+                in_scope_subs += 1
+                k = ("", sub)
+                if k in seen_host_keys:
+                    continue
+                seen_host_keys.add(k)
+                obs.hosts.append(Host(hostname=sub))
+                for ip in result.resolved.get(sub, []):
+                    k2 = (ip, sub)
+                    if k2 in seen_host_keys:
+                        continue
+                    seen_host_keys.add(k2)
+                    try:
+                        self.scope_guard.check(ip)
+                        obs.hosts.append(Host(ip=ip, hostname=sub))
+                        total_ips += 1
+                    except ScopeViolation:
+                        pass
+
+        counts = self.store.commit(obs) if seen_host_keys else {"hosts": 0}
+        self.audit.log(
+            "passive_recon",
+            {
+                "apexes": apexes,
+                "in_scope_subs": in_scope_subs,
+                "oos_subs": oos_subs,
+                "ips": total_ips,
+                "committed": counts,
+            },
+        )
+        logger.info(
+            f"[bold]passive-recon[/bold] {len(apexes)} apex → "
+            f"{in_scope_subs} in-scope sub(s), {oos_subs} OOS, "
+            f"{counts.get('hosts', 0)} new host(s)"
+        )
+
     # ---------------------------------------------------------------- loop
     def run(self) -> dict[str, Any]:
         logger.info(f"[bold green]pentagent[/bold green] starting session {self.session_dir.name}")
@@ -264,6 +371,11 @@ class Orchestrator:
             f"[bold]parallel[/bold]={self.parallel_actions}"
         )
         self._bootstrap_seeds()
+        # Passive-recon sweep: crt.sh CT + DNS. Best-effort, offline-safe.
+        try:
+            self._passive_recon()
+        except Exception as e:
+            logger.debug(f"passive_recon swallowed: {e}")
         stop_reason = "unknown"
         stall_counter = 0
         current_phase: Phase = Phase.recon

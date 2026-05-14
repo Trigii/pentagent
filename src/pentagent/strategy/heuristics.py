@@ -49,6 +49,7 @@ class _State:
     amass_done: set[str] = field(default_factory=set)
     httpx_done: set[str] = field(default_factory=set)
     nmap_done: set[str] = field(default_factory=set)          # host key (ip or hostname)
+    nmap_deep_done: set[str] = field(default_factory=set)     # host key where -sC/NSE has been run
     content_disc_done: set[int] = field(default_factory=set)  # webapp_ids touched by ffuf/gobuster/katana
     ffuf_done_small: set[int] = field(default_factory=set)    # webapp_ids hit with small wordlist
     ffuf_done_big: set[int] = field(default_factory=set)      # webapp_ids hit with big wordlist
@@ -90,6 +91,15 @@ class HeuristicPlanner:
                 tgt = p.get("target")
                 if tgt:
                     st.nmap_done.add(str(tgt))
+                    # A deep scan is identified either by an explicit
+                    # scan_profile or by the presence of -sC / --script
+                    # in the flags.
+                    prof = str(p.get("scan_profile") or "").lower()
+                    flags = [str(f) for f in (p.get("flags") or [])]
+                    if prof in ("deep", "nse") or any(
+                        f == "-sC" or f.startswith("--script") for f in flags
+                    ):
+                        st.nmap_deep_done.add(str(tgt))
             elif tool == "ffuf":
                 if "webapp_id" in p:
                     wid = int(p["webapp_id"])
@@ -231,6 +241,64 @@ class HeuristicPlanner:
                         },
                         reason=f"no port-scan yet for {target}",
                         expected_signal="open TCP services + versions",
+                        priority=ActionPriority.high,
+                    )
+                )
+
+        # -----------------------------------------------------------------
+        # 3b. Deep NSE script scan — once the initial nmap has finished
+        #     and we know which ports are open, kick off a targeted
+        #     scan with -sC (default scripts) restricted to those ports.
+        #     This is methodology step 3: "for each open port perform a
+        #     service version detection and a script scan".
+        #
+        #     Gated on:
+        #       - initial nmap done (host in nmap_done)
+        #       - at least one service observed (svc_by_host > 0)
+        #       - deep scan not yet run (host not in nmap_deep_done)
+        #
+        #     `-sC` is the safe default-script set; `--script=vuln` is
+        #     *not* added here because it's aggressive/intrusive and
+        #     runs exploit templates — the agent escalates to that only
+        #     via explicit opt-in through scan profiles.
+        # -----------------------------------------------------------------
+        if cfg.tool("nmap").enabled:
+            deep_seen: set[str] = set()
+            for h in hosts:
+                target = h.hostname or h.ip
+                if not target or target in deep_seen:
+                    continue
+                if target not in done.nmap_done:
+                    continue
+                if target in done.nmap_deep_done:
+                    continue
+                # Need at least one observed service so we have ports to scan.
+                host_svcs = [s for s in store.services() if s.host_id == h.id]
+                if not host_svcs:
+                    continue
+                if not self._in_scope(target):
+                    continue
+                deep_seen.add(target)
+                ports = sorted({int(s.port) for s in host_svcs if s.port is not None})
+                port_str = ",".join(str(p) for p in ports)
+                out.append(
+                    Action(
+                        tool="nmap",
+                        params={
+                            "target": target,
+                            "ports": port_str,
+                            "flags": ["-sV", "-sC", "-Pn", "-T3"],
+                            "scan_profile": "deep",
+                        },
+                        parser_context={"entity_type": "Host", "entity_id": h.id},
+                        reason=(
+                            f"deep NSE script scan on {len(ports)} known open "
+                            f"port(s) of {target} ({port_str})"
+                        ),
+                        expected_signal=(
+                            "NSE-derived banners, TLS cipher suites, HTTP "
+                            "headers, SMB signing, FTP anon status, cert info"
+                        ),
                         priority=ActionPriority.high,
                     )
                 )
@@ -458,10 +526,20 @@ class HeuristicPlanner:
                 )
 
         # -----------------------------------------------------------------
-        # 11. Finding-driven follow-ups. A panel/exposure/CVE finding is
-        #     a high-signal cue the baseline loop ignores (it only reads
-        #     graph state). Synthesize targeted next steps here so the
-        #     agent chains: `nuclei` → `nuclei -tags flowise` →  etc.
+        # 11. Reactive follow-ups from four channels:
+        #       (a) finding-driven  — panel/exposure/CVE findings chain
+        #                              into tag-targeted nuclei runs.
+        #       (b) service-driven  — each fingerprinted service (ssh,
+        #                              ftp, smb, mysql, ...) triggers a
+        #                              per-service nuclei sweep.
+        #       (c) tech-driven     — httpx tech_detect (wordpress,
+        #                              laravel, apache, ...) triggers a
+        #                              CMS/framework-specific nuclei run.
+        #       (d) vuln-class      — systematic sweep per OWASP class
+        #                              (lfi/sqli/xss/ssrf/...), gated on
+        #                              whether the webapp has already had
+        #                              a generic nuclei pass so we don't
+        #                              flood the queue on round 1.
         #
         #     The heuristic baseline above already proposed a catch-all
         #     nuclei run on every WebApp. Signatures for tag-targeted
@@ -472,8 +550,24 @@ class HeuristicPlanner:
             findings = store.findings()
         except Exception:
             findings = []
-        if findings:
-            out.extend(_synthesize_followups(findings, webapps))
+        try:
+            services = store.services()
+        except Exception:
+            services = []
+
+        # Vuln-class sweep only after a generic nuclei has happened on at
+        # least one webapp — avoids flooding the queue during recon.
+        nuclei_ran = bool(done.nuclei_done)
+        out.extend(
+            _synthesize_followups(
+                findings,
+                webapps,
+                services=services,
+                hosts=hosts,
+                include_tech=True,
+                include_vuln_classes=nuclei_ran,
+            )
+        )
 
         # Phase-aware ordering: earlier phase wins, ties broken by priority.
         out.sort(key=lambda a: a.sort_key())

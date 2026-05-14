@@ -37,6 +37,7 @@ from ..logging_setup import get_logger
 from ..memory import Finding, KnowledgeStore, Severity
 from ..prompts import SYSTEM_PROMPT, render_reporter_prompt
 from ..strategy.phases import phase_of
+from .poc import build_poc as _deterministic_poc
 
 
 logger = get_logger(__name__)
@@ -141,6 +142,20 @@ class Reporter:
             std = map_finding(f.kind)
             ctx = self._finding_context(f)
             cvss = self._extract_cvss(f, ctx)
+            # Deterministic PoC fallback — runs even with no LLM, and
+            # backfills the LLM's PoC slot when the LLM left it blank.
+            poc_text = (enh.get("proof_of_concept") if enh else None) or ""
+            if not poc_text:
+                fb_finding = {
+                    "kind": f.kind,
+                    "template_id": f.template_id,
+                    "title": f.title,
+                    "severity": _sev_label(f),
+                    "confidence": f.confidence,
+                    "references": (enh.get("references") if enh else None) or [],
+                }
+                poc_text = _deterministic_poc(fb_finding, ctx) or ""
+
             findings_block.append({
                 "id": f.id,
                 "severity": _sev_label(f),
@@ -155,7 +170,7 @@ class Reporter:
                 "description": (enh.get("impact") if enh else None) or f.description,
                 "recommendation": (enh.get("remediation") if enh else None) or f.recommendation,
                 "steps": (enh.get("steps_to_reproduce") if enh else None) or [],
-                "proof_of_concept": (enh.get("proof_of_concept") if enh else None) or "",
+                "proof_of_concept": poc_text,
                 "references": (enh.get("references") if enh else None) or [],
                 "standards": std,
                 "cvss": cvss,
